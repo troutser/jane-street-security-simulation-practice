@@ -25,7 +25,8 @@ echo "----------------------------------------------------------------"
 echo "questions.md has your investigative questions. Use grep/less/pipes on"
 echo "auth.log, access.log, firewall.log, dns.log, exec.log in this directory."
 echo
-echo "Run:  $ROOT/check.sh     when you want the answers for THIS scenario."
+echo "Run:  $ROOT/quiz.sh      to self-check your answers one at a time (no spoilers)."
+echo "Run:  $ROOT/check.sh     when you want the full answer key for THIS scenario."
 echo "Type: exit               to leave this scenario shell."
 echo "----------------------------------------------------------------"
 

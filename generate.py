@@ -172,7 +172,9 @@ def render_questions(scn):
              "`grep` to filter, and pipe into `sort` / `uniq -c` / `wc -l` / `awk` / `cut` as needed.\n"]
     for i, q in enumerate(scn["questions"], 1):
         lines.append(f"{i}. {q['q']}")
-    lines.append("\nRun `../../check.sh` (or just `check.sh` if you copied it in) when you want the answers.\n")
+    lines.append("\nRun `../../quiz.sh` to self-check one question at a time without spoilers, or "
+                 "`../../check.sh` (or just `quiz.sh`/`check.sh` if you copied them in) when you want "
+                 "the full answer key.\n")
     return "\n".join(lines)
 
 

@@ -22,7 +22,20 @@ ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`).
 `scenarios/run-<timestamp>/` so `auth.log`, `access.log`, `firewall.log`, `dns.log`, and
 `exec.log` are all right there for `grep`/`less`. Type `exit` to leave that shell.
 
-When you're ready (or stuck), run:
+When you want to check your work **without spoiling anything**, run:
+
+```bash
+./quiz.sh
+```
+
+from inside the scenario directory (or anywhere, via the `SECURITY_SIM_SCENARIO` env
+var `practice.sh` sets up). It asks each question from `questions.md` one at a time and
+grades your typed answer against `answers.md` — it never shows the answer, the
+pipeline, or the explanation unless you ask. Type `?` on a question to reveal just that
+answer, `skip` to move on without seeing it, or `quit` to stop early. You get a score
+out of the total at the end.
+
+When you're ready to see everything (or stuck), run:
 
 ```bash
 ./check.sh
@@ -136,6 +149,7 @@ field has a variable number of words and breaks naive `awk '{print $N}'` column 
 - `generate.py` — the generator (Python; everything downstream is plain grep/less/pipes)
 - `simlib/` — the pools of random data, the 15 archetypes, the generic question bank
 - `practice.sh` — generate + drop into the scenario directory
+- `quiz.sh` — self-check your answers one question at a time, no spoilers
 - `check.sh` — reveal `answers.md` for the current scenario
 - `progress.md` — auto-appended log of every scenario you've generated, so you can spot
   which archetypes you haven't drilled yet
