@@ -10,6 +10,7 @@ from collections import Counter
 def generic_bank(ctx, log_texts, primary_ip):
     access = log_texts.get("access", [])
     auth = log_texts.get("auth", [])
+    endpoint = log_texts.get("endpoint", [])
     bank = []
 
     ua = ctx.canary_scanner_ua
@@ -66,6 +67,18 @@ def generic_bank(ctx, log_texts, primary_ip):
         skills=["-v", "-P", "pipeline"],
     ))
 
+    cmdline = ctx.canary_endpoint_cmdline
+    cmdline_count = sum(1 for l in endpoint if cmdline in l)
+    bank.append(dict(
+        q=f"Employee workstations routinely run a video-conferencing client whose logged command line is "
+          f"the exact string `{cmdline}`. How many lines in endpoint.log show that literal process launch?",
+        a=str(cmdline_count),
+        cmd=f"grep -F -c '{cmdline}' endpoint.log",
+        explain="The path is full of regex metacharacters -- parentheses, backslashes, a space -- so -F is "
+                "what makes matching it literally possible instead of writing an escaped mess.",
+        skills=["-F", "-c"],
+    ))
+
     if primary_ip:
         ip_word_pat = re.compile(r'\b' + re.escape(primary_ip) + r'\b')
         files_with_ip = sorted(name for name, lines in log_texts.items()
@@ -73,7 +86,7 @@ def generic_bank(ctx, log_texts, primary_ip):
         bank.append(dict(
             q=f"Across all the log files in this scenario, which file(s) mention the IP `{primary_ip}` at all?",
             a=", ".join(f"{f}.log" for f in files_with_ip) if files_with_ip else "(none)",
-            cmd=f"grep -rl -F -w '{primary_ip}' .",
+            cmd=f"grep -rl -F -w '{primary_ip}' . | sed 's|^\\./||' | sort",
             explain="-r recurses into every file in the current directory and -l prints just the matching "
                     "filenames instead of the matching lines.",
             skills=["-r", "-l", "-F"],

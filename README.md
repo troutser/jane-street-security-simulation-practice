@@ -15,6 +15,8 @@ ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`).
 ```bash
 ./practice.sh                 # generate a medium scenario and drop into its directory
 ./practice.sh --hard          # harder: more archetypes layered + decoys + more noise
+./practice.sh --insane        # brutal: 3-4 archetypes + 2-3 decoys, ~1.8x the noise of --hard,
+                               # a 90-hour window, and 8 questions instead of 6
 ./practice.sh --easy --seed 42   # reproduce a specific scenario later
 ```
 
@@ -30,10 +32,15 @@ When you want to check your work **without spoiling anything**, run:
 
 from inside the scenario directory (or anywhere, via the `SECURITY_SIM_SCENARIO` env
 var `practice.sh` sets up). It asks each question from `questions.md` one at a time and
-grades your typed answer against `answers.md` — it never shows the answer, the
-pipeline, or the explanation unless you ask. Type `?` on a question to reveal just that
-answer, `skip` to move on without seeing it, or `quit` to stop early. You get a score
-out of the total at the end.
+grades your typed answer against `answers.md` — it never shows the exact pipeline unless
+you run `check.sh`. Grading accepts reasonable variants of compound answers (e.g. typing
+just the IP, or just the count, when the answer is "IP (N requests)"), not only the exact
+string. Type `?` on a question to reveal just that answer, `skip` to move on without
+seeing it, or `quit` to stop early. After every question it prints the one-line "why it
+matters" explanation — say your own reasoning out loud before reading it, since the
+actual interview is about explaining your thought process to an engineer, not just
+producing the right fact. You get a score out of the total at the end, plus a few
+generic follow-up prompts worth rehearsing against each answer.
 
 When you're ready to see everything (or stuck), run:
 
@@ -49,7 +56,7 @@ matters.
 You can also skip the wrapper and call the generator directly:
 
 ```bash
-python3 generate.py [--easy|--medium|--hard] [--seed N]
+python3 generate.py [--easy|--medium|--hard|--insane] [--seed N]
 ```
 
 ## Reproducibility
@@ -68,21 +75,31 @@ scenarios/run-20260917-142301/
   access.log           Apache/Nginx combined log format
   firewall.log         iptables/netfilter-style DROP/ACCEPT entries
   dns.log              BIND-style DNS query log
-  exec.log             auditd-style EXECVE process log
+  exec.log             auditd-style EXECVE process log (servers)
+  endpoint.log         EDR/Sysmon-style process log, WITH parent process (workstations)
   briefing.md          the incident backstory
-  questions.md         4-6 investigative questions with checkable answers
+  questions.md         4-8 investigative questions with checkable answers
   answers.md           the answers + exact pipelines + why each flag matters
   scenario_meta.json   which archetypes were planted, for the progress log
 ```
 
 Each log file has thousands of lines of realistic background noise (regular visitor
 traffic, benign SSH logins, cron jobs, normal DNS lookups, background internet port
-scanning) with one or more attack patterns planted inside. You cannot eyeball these —
-you have to `grep`/`less`/pipe your way through them.
+scanning, ordinary workstation activity) with one or more attack patterns planted
+inside. You cannot eyeball these — you have to `grep`/`less`/pipe your way through them.
+
+`exec.log` and `endpoint.log` look similar (both are process-execution logs) but serve
+different roles: `exec.log` is server-side auditd, one flat event per line; `endpoint.log`
+is workstation EDR/Sysmon-style and additionally records **who spawned it** (a `parent=`
+field), so some questions require walking a process tree — filtering on a child's parent
+field to find what it launched next — rather than reading one event in isolation. Every
+human employee has exactly one named workstation (`wkstn-<dept>-NN`) tied to their
+existing account and internal IP, so a workstation can be cross-referenced against the
+same identity you already found in auth.log or access.log.
 
 ## The archetype library
 
-Fifteen attack/incident patterns are in rotation, so scenarios don't repeat:
+Seventeen attack/incident patterns are in rotation, so scenarios don't repeat:
 
 1. SSH brute force
 2. Password spraying
@@ -99,11 +116,55 @@ Fifteen attack/incident patterns are in rotation, so scenarios don't repeat:
 13. Insider after-hours data access
 14. Port scanning
 15. Log tampering (doubled-word artifacts, suspicious restart markers)
+16. Full compromise chain — brute force → internal pivot → recon → C2 beacon, one actor
+    followed across auth.log, exec.log, and firewall.log
+17. Workstation phishing/malware chain — a double-extension lure spawns a living-off-the-land
+    binary, followed across endpoint.log's process tree, dns.log, and firewall.log
 
 **Easy** plants one archetype. **Medium** plants one or two. **Hard** plants two or
 three *plus* one or two additional "decoy" archetypes — their traffic is in the logs
 and adds realistic noise/red herrings, but they're not asked about directly, so you
 have to confirm what's actually relevant instead of assuming every anomaly matters.
+**Insane** plants three or four *plus* two or three decoys (up to seven attack patterns
+layered into one run), with ~1.8x hard's noise volume, a 90-hour window instead of 60,
+and 8 questions instead of 6 — expect a lot more red herrings and a lot more log to
+wade through before anything stands out.
+
+## Multi-source corroboration
+
+A single grep telling you a fact isn't the same as *proving* it — a login in auth.log
+only proves an application accepted credentials; it doesn't prove a real network
+connection carried it, or that anything ran afterward. Several archetypes now include a
+question that deliberately can't be answered from one log file: you pull a fact out of
+one log (an IP, a hostname, a timestamp) and use it to search a *different* log for
+independent confirmation before the finding counts as solid.
+
+- **C2 beaconing** — corroborate the firewall beacon against a DNS resolution for the
+  same C2 domain, recorded in dns.log just before the beacon starts.
+- **Web shell upload** — corroborate the reverse shell's destination port (claimed by
+  the process in exec.log) against an actual outbound connection in firewall.log.
+- **Privilege escalation** — corroborate that a sudo grant in auth.log actually *ran*,
+  by finding the matching PID in exec.log.
+- **Lateral movement** — corroborate the number of hosts reached (per auth.log logins)
+  against the number of distinct hosts with a matching internal connection in
+  firewall.log, then corroborate a THIRD way on the origin workstation itself: which
+  endpoint.log process actually scripted the SSH hops.
+- **Insider after-hours access** — once auth.log ties the IP to a username, corroborate
+  a third and final time in endpoint.log to find the actual physical workstation tied
+  to that account.
+- **Full compromise chain** — the whole archetype is built around this: each of its four
+  questions carries a fact from the previous log into the next one, ending with tying
+  a firewall beacon on a *different* host back to the *original* attacker IP from the
+  very first question.
+- **Workstation phishing/malware chain** — also built entirely around this: a
+  double-extension lure in endpoint.log spawns a living-off-the-land binary (found by
+  walking the process tree's `parent=` field, not just spotting a suspicious process),
+  which is corroborated against a DNS resolution and then a firewall connection to the
+  same C2 infrastructure -- three independent logs agreeing before it counts as confirmed.
+
+The point isn't just finding an answer — it's whether two independent, unrelated
+logging subsystems agree with each other, which is what separates "I found something
+suspicious" from "I can prove what happened."
 
 ## Guaranteed skill coverage
 

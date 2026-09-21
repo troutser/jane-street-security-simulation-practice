@@ -1,13 +1,13 @@
 """Baseline benign traffic generators for each log, plus a couple of always-present
 'canary' patterns that the generic question bank relies on for grep -F / -P practice."""
-from .pool import (rand_internal_ip, DOMAINS_LEGIT, UA_LEGIT,
-                    PATHS_LEGIT, SUDO_COMMANDS_BENIGN)
-from .logfmt import auth_line, access_line, iptables_line, dns_line, exec_line
+from .pool import DOMAINS_LEGIT, UA_LEGIT, PATHS_LEGIT, SUDO_COMMANDS_BENIGN, BENIGN_PROC_CHAINS
+from .logfmt import auth_line, access_line, iptables_line, dns_line, exec_line, endpoint_line
 
 VOLUME = {
-    "easy":   dict(access=1500, auth=800,  firewall=900,  dns=700,  exec=500),
-    "medium": dict(access=3000, auth=1400, firewall=1800, dns=1500, exec=900),
-    "hard":   dict(access=5000, auth=2200, firewall=3200, dns=2500, exec=1500),
+    "easy":   dict(access=1500, auth=800,  firewall=900,  dns=700,  exec=500, endpoint=600),
+    "medium": dict(access=3000, auth=1400, firewall=1800, dns=1500, exec=900, endpoint=1100),
+    "hard":   dict(access=5000, auth=2200, firewall=3200, dns=2500, exec=1500, endpoint=1800),
+    "insane": dict(access=9000, auth=4000, firewall=5800, dns=4500, exec=2600, endpoint=3200),
 }
 
 
@@ -82,13 +82,13 @@ def gen_firewall_noise(ctx, n):
         mac = ":".join(f"{rng.randint(0,255):02x}" for _ in range(6))
         outbound = rng.random() < 0.4
         if outbound:
-            src = rand_internal_ip(rng, ctx.internal_octet)
+            src = ctx.safe_noise_internal_ip()
             dst = ctx.safe_noise_public_ip()
             action, spt, dpt = "ACCEPT", rng.randint(1024, 65000), rng.choice([443, 80, 53])
         else:
             # low-volume background internet scan noise, spread across many source ips
             src = rng.choice(scan_ips)
-            dst = rand_internal_ip(rng, ctx.internal_octet)
+            dst = ctx.safe_noise_internal_ip()
             dpt = rng.choice([22, 23, 80, 443, 445, 3389, 8080, 8443, 3306])
             action, spt = "DROP", rng.randint(1024, 65000)
         flags = rng.choice(["SYN", "SYN ACK", "ACK", "FIN ACK"])
@@ -103,7 +103,7 @@ def gen_dns_noise(ctx, n):
     host = ctx.primary_dns
     for _ in range(n):
         dt = ctx.random_ts()
-        client = rand_internal_ip(rng, ctx.internal_octet)
+        client = ctx.safe_noise_internal_ip()
         qname = rng.choice(DOMAINS_LEGIT)
         if rng.random() < 0.3:
             qname = f"{rng.choice(['www', 'api', 'cdn', 'static', 'mail'])}.{qname}"
@@ -122,10 +122,36 @@ def gen_exec_noise(ctx, n):
         ("/usr/bin/python3", "python3 manage.py migrate"), ("/usr/bin/npm", "npm install"),
         ("/usr/bin/tar", "tar -czf /backup/nightly.tar.gz /var/www"),
     ]
+    # exclude accounts an archetype reserved as its protagonist -- otherwise a benign
+    # noise exec line for that same username could land right next to (or after) the
+    # planted event and break a username-keyed grep filter or a "latest matching line"
+    # (tail -1) lookup in exec.log.
+    noise_accounts = [a for a in ctx.all_local_accounts if a not in ctx.reserved_users]
     for _ in range(n):
         dt = ctx.random_ts()
-        user = rng.choice(ctx.all_local_accounts)
+        user = rng.choice(noise_accounts or ctx.all_local_accounts)
         exe, cmd = rng.choice(cmds)
         uid = 0 if user in ctx.service_accounts else rng.randint(1000, 1050)
         events.append((dt, exec_line(dt, host, uid, user, exe, cmd, rng.randint(1000, 32000))))
+    return events
+
+
+def gen_endpoint_noise(ctx, n):
+    """Routine workstation activity: office apps, browsers, background services. Only
+    real employees have a workstation (see ctx.user_workstation) -- service accounts
+    don't get one -- and, same as exec noise, an archetype's reserved protagonist is
+    excluded so a benign noise process never lands next to (or after) their planted one
+    and breaks a username/workstation-keyed grep filter."""
+    rng = ctx.rng
+    events = []
+    noise_users = [u for u in ctx.users if u not in ctx.reserved_users]
+    for _ in range(n):
+        dt = ctx.random_ts()
+        user = rng.choice(noise_users or ctx.users)
+        host = ctx.user_workstation[user]
+        parent, child, cmdline_tmpl = rng.choice(BENIGN_PROC_CHAINS)
+        cmdline = cmdline_tmpl.format(u=user)
+        ppid = rng.randint(1000, 9000)
+        pid = rng.randint(9001, 32000)
+        events.append((dt, endpoint_line(dt, host, user, pid, ppid, child, parent, cmdline)))
     return events

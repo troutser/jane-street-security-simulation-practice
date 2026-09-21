@@ -34,3 +34,12 @@ def dns_line(dt, host, client_ip, port, qname, qtype, server):
 
 def exec_line(dt, host, uid, user, exe, cmd, pid):
     return f"{syslog_ts(dt)} {host} audit: EXECVE pid={pid} uid={uid}({user}) exe=\"{exe}\" cmd=\"{cmd}\""
+
+
+def endpoint_line(dt, host, user, pid, ppid, image, parent_image, cmdline):
+    """A workstation EDR/Sysmon-style process-creation record -- distinct from exec_line
+    (server-side auditd) in that it carries the PARENT process too, so investigating it
+    means walking a process tree (image spawned by parent_image) rather than reading one
+    flat event."""
+    return (f"{syslog_ts(dt)} {host} endpointd: user={user} pid={pid} ppid={ppid} "
+            f"image=\"{image}\" parent=\"{parent_image}\" cmdline=\"{cmdline}\"")

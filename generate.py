@@ -3,12 +3,12 @@
 Infinite scenario generator for grep/less/pipeline investigation practice.
 
 Usage:
-  python3 generate.py [--easy|--medium|--hard] [--seed N]
+  python3 generate.py [--easy|--medium|--hard|--insane] [--seed N]
 
 Creates scenarios/run-<timestamp>/ containing:
-  auth.log, access.log, firewall.log, dns.log, exec.log   - the evidence
+  auth.log, access.log, firewall.log, dns.log, exec.log, endpoint.log   - the evidence
   briefing.md                                              - incident backstory
-  questions.md                                              - 4-6 checkable questions
+  questions.md                                              - 4-8 checkable questions
   answers.md                                                - answers + exact pipelines
 Also appends a line to progress.md and updates scenarios/.latest.
 """
@@ -31,9 +31,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 SCENARIOS_DIR = os.path.join(ROOT, "scenarios")
 PROGRESS_PATH = os.path.join(ROOT, "progress.md")
 
-LOG_NAMES = ["auth", "access", "firewall", "dns", "exec"]
+LOG_NAMES = ["auth", "access", "firewall", "dns", "exec", "endpoint"]
 
-TARGET_TOTAL = {"easy": 4, "medium": 5, "hard": 6}
+TARGET_TOTAL = {"easy": 4, "medium": 5, "hard": 6, "insane": 8}
 
 
 def parse_args():
@@ -42,12 +42,16 @@ def parse_args():
     g.add_argument("--easy", action="store_true")
     g.add_argument("--medium", action="store_true")
     g.add_argument("--hard", action="store_true")
+    g.add_argument("--insane", action="store_true", help="More archetypes, more decoys, far more noise, "
+                   "a wider time window, and more questions than --hard.")
     p.add_argument("--seed", type=int, default=None, help="Reproduce a specific scenario.")
     args = p.parse_args()
     if args.easy:
         difficulty = "easy"
     elif args.hard:
         difficulty = "hard"
+    elif args.insane:
+        difficulty = "insane"
     else:
         difficulty = "medium"
     return difficulty, args.seed
@@ -64,8 +68,10 @@ def select_archetypes(ctx, difficulty):
     rng = ctx.rng
     pool = list(REGISTRY)
     rng.shuffle(pool)
-    n_featured = {"easy": 1, "medium": rng.choice([1, 2]), "hard": rng.choice([2, 3])}[difficulty]
-    n_decoy = {"easy": 0, "medium": rng.randint(0, 1), "hard": rng.randint(1, 2)}[difficulty]
+    n_featured = {"easy": 1, "medium": rng.choice([1, 2]), "hard": rng.choice([2, 3]),
+                  "insane": rng.choice([3, 4])}[difficulty]
+    n_decoy = {"easy": 0, "medium": rng.randint(0, 1), "hard": rng.randint(1, 2),
+               "insane": rng.randint(2, 3)}[difficulty]
     n_featured = min(n_featured, len(pool))
     featured = pool[:n_featured]
     decoys = pool[n_featured:n_featured + n_decoy]
@@ -103,6 +109,7 @@ def build_scenario(difficulty, seed):
     logs["firewall"] += noise.gen_firewall_noise(ctx, vol["firewall"])
     logs["dns"] += noise.gen_dns_noise(ctx, vol["dns"])
     logs["exec"] += noise.gen_exec_noise(ctx, vol["exec"])
+    logs["endpoint"] += noise.gen_endpoint_noise(ctx, vol["endpoint"])
 
     # sort each log chronologically and drop down to plain text lines
     log_texts = {}
@@ -122,20 +129,36 @@ def build_scenario(difficulty, seed):
 
     target = TARGET_TOTAL[difficulty]
     questions = list(all_featured_questions)
+
+    # reserve at least one slot for a generic-bank question (when any exist) BEFORE
+    # topping up -- otherwise a single question-heavy archetype (or several) can fill
+    # the whole target on its own and silently defeat the "-F/-P/pipeline/-r -l always
+    # present" guarantee described in the README.
+    # Several archetypes deliberately put their dns.log/firewall.log multi-source
+    # corroboration question LAST in their own question list (that's the payoff the
+    # README's "Multi-source corroboration" section describes). Picking a random index
+    # among the over-represented source's questions -- instead of always the last one --
+    # keeps trimming from silently guillotining that exact question every time.
+    def trim_one(qs, worst_source):
+        candidates = [i for i, q in enumerate(qs) if q.get("_source", "generic") == worst_source]
+        qs.pop(ctx.rng.choice(candidates))
+
+    feature_cap = max(target - (1 if generic else 0), 0)
+    while len(questions) > feature_cap:
+        counts = Counter(q.get("_source", "generic") for q in questions)
+        worst_source = counts.most_common(1)[0][0]
+        trim_one(questions, worst_source)
+
     ctx.rng.shuffle(generic)
     gi = 0
     while len(questions) < target and gi < len(generic):
         questions.append(generic[gi])
         gi += 1
-    # if archetypes alone overflow the target (e.g. 3 featured archetypes x 2Q), trim evenly
+    # if archetypes alone still overflow the target, trim evenly the same way
     while len(questions) > target:
-        # drop the last question belonging to whichever source contributed the most
         counts = Counter(q.get("_source", "generic") for q in questions)
         worst_source = counts.most_common(1)[0][0]
-        for i in range(len(questions) - 1, -1, -1):
-            if questions[i].get("_source", "generic") == worst_source:
-                questions.pop(i)
-                break
+        trim_one(questions, worst_source)
     ctx.rng.shuffle(questions)
 
     return dict(ctx=ctx, difficulty=difficulty, seed=seed, log_texts=log_texts,
@@ -154,8 +177,9 @@ def render_briefing(scn):
         h for role in ctx.hosts.values() for h in role))) + "\n")
     lines.append("\n## What we know so far\n")
     lines.append("The SOC on-call was paged after automated alerting flagged unusual activity. "
-                  "You've been handed `auth.log`, `access.log`, `firewall.log`, `dns.log`, and "
-                  "`exec.log` covering the window above. Here's what's been reported:\n")
+                  "You've been handed `auth.log`, `access.log`, `firewall.log`, `dns.log`, `exec.log`, "
+                  "and `endpoint.log` (workstation process activity) covering the window above. "
+                  "Here's what's been reported:\n")
     for res in scn["featured"]:
         lines.append(f"- {res['briefing']}")
     lines.append("\nYour job is to work the evidence with `grep`, `less`, and shell pipelines and "
@@ -168,7 +192,7 @@ def render_briefing(scn):
 def render_questions(scn):
     lines = ["# Investigation Questions\n",
              "Answer each with a specific, checkable fact (an IP, a username, a count, a timestamp...). "
-             "Everything you need is in the five log files in this directory. Use `less` to browse, "
+             "Everything you need is in the six log files in this directory. Use `less` to browse, "
              "`grep` to filter, and pipe into `sort` / `uniq -c` / `wc -l` / `awk` / `cut` as needed.\n"]
     for i, q in enumerate(scn["questions"], 1):
         lines.append(f"{i}. {q['q']}")
