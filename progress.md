@@ -18,3 +18,7 @@ Appended automatically on every `generate.py` run. Use it to see which archetype
 - **2026-09-20 23:27:47** | `run-20260920-232747` | difficulty=medium | seed=103593887 | featured=[Privilege escalation via sudo abuse] | decoys=[Log tampering]
 - **2026-09-21 04:31:18** | `run-20260921-043118` | difficulty=medium | seed=2149965572 | featured=[Credential stuffing] | decoys=[Password spraying]
 - **2026-09-21 04:31:24** | `run-20260921-043124` | difficulty=hard | seed=913766798 | featured=[Full compromise chain (brute force -> pivot -> recon -> C2), DNS tunneling, DGA beaconing] | decoys=[Log tampering]
+- **2026-09-21 06:21:31** | `run-20260921-062131` | difficulty=medium | seed=3693775259 | featured=[Full compromise chain (brute force -> pivot -> recon -> C2)] | decoys=[Lateral movement]
+- **2026-09-21 06:21:38** | `run-20260921-062138` | difficulty=hard | seed=3308002693 | featured=[Insider after-hours access, DNS tunneling] | decoys=[C2 beaconing]
+- **2026-09-21 06:45:01** | `run-20260921-064501` | difficulty=hard | seed=25025997 | featured=[Workstation phishing/malware chain, Port scanning, Credential stuffing] | decoys=[Data exfiltration, Directory traversal]
+- **2026-09-21 17:38:27** | `run-20260921-173827` | difficulty=hard | seed=438579350 | featured=[C2 beaconing, Lateral movement] | decoys=[Data exfiltration, Password spraying]
